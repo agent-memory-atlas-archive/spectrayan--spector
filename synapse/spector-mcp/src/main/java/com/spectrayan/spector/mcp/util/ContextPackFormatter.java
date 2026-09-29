@@ -25,24 +25,52 @@ import com.spectrayan.spector.memory.pathway.skill.model.SkillBody;
 import com.spectrayan.spector.kernel.api.MemoryType;
 
 /**
- * Formats multi-tier cognitive memory into structured, token-budgeted markdown context packs.
+ * Formats multi-tier cognitive memory into structured, token-budgeted markdown context packs
+ * using declarative Handlebars templates.
  *
- * <p>Allocates token budgets across cognitive dimensions:</p>
+ * <h3>Dual-Plane Rendering</h3>
+ * <p>This formatter supports two rendering modes for LLM prompt prefix cache efficiency:</p>
  * <ul>
- *   <li><b>Working Memory & Intent</b> (~20% budget): active conversational goals and scratchpad</li>
- *   <li><b>Procedural Heuristics & Cadence</b> (~25% budget): crystallized decision rules and skills</li>
- *   <li><b>Core Semantic Facts & Axioms</b> (~30% budget): beliefs, facts, and world models</li>
- *   <li><b>Chrono-Episodic Memories</b> (~25% budget): episodic stories and experiences</li>
+ *   <li><b>{@link #formatStaticPrefix}</b>: Stable content (persona, procedural skills, semantic axioms)
+ *       that remains byte-identical across turns within a session. Rendered via
+ *       {@code /mcp/templates/memory-context-pack-static.hbs} for system prompt caching.</li>
+ *   <li><b>{@link #formatDynamicTail}</b>: Volatile content (working scratchpad, episodic memories,
+ *       turn-specific semantic matches, fact transitions) that varies per turn. Rendered via
+ *       {@code /mcp/templates/memory-context-pack-dynamic.hbs} for user-turn injection.</li>
+ *   <li><b>{@link #formatSplit}</b>: Renders both planes separated by the cache boundary marker
+ *       via {@code /mcp/templates/memory-context-pack-split.hbs}.</li>
  * </ul>
+ *
+ * <p>The original {@link #format} method is preserved for backward compatibility and delegates
+ * to both planes.</p>
  */
 public final class ContextPackFormatter {
 
     private static final int CHARS_PER_TOKEN = 4;
 
+    /**
+     * Default importance threshold for classifying semantic memories as static axioms.
+     * Memories with importance &ge; this value are rendered in the static prefix;
+     * those below go to the dynamic tail. Based on a 0–10 importance scale.
+     */
+    public static final float DEFAULT_STATIC_IMPORTANCE_THRESHOLD = 5.0f;
+
     private ContextPackFormatter() {}
 
     /**
      * Input data bundle for context pack generation.
+     *
+     * @param query                       the recall query for this turn
+     * @param workingIntent               active intent / scratchpad note
+     * @param recalledMemories            all recalled memories across tiers
+     * @param factHistories               bitemporal fact transition histories
+     * @param tokenBudget                 total token budget for the context pack
+     * @param profileName                 cognitive recall profile name
+     * @param personaId                   active persona identifier
+     * @param staticImportanceThreshold   importance threshold for static/dynamic semantic split;
+     *                                    semantic memories with {@code importance >= threshold}
+     *                                    go to the static prefix, others to the dynamic tail.
+     *                                    Defaults to {@value #DEFAULT_STATIC_IMPORTANCE_THRESHOLD}.
      */
     public record ContextPackInput(
             String query,
@@ -51,190 +79,322 @@ public final class ContextPackFormatter {
             List<FactHistory> factHistories,
             int tokenBudget,
             String profileName,
-            String personaId
+            String personaId,
+            float staticImportanceThreshold
     ) {
+        /**
+         * Backward-compatible constructor without staticImportanceThreshold.
+         */
+        public ContextPackInput(String query, String workingIntent,
+                                List<CognitiveResult> recalledMemories,
+                                List<FactHistory> factHistories,
+                                int tokenBudget, String profileName,
+                                String personaId) {
+            this(query, workingIntent, recalledMemories, factHistories,
+                    tokenBudget, profileName, personaId,
+                    DEFAULT_STATIC_IMPORTANCE_THRESHOLD);
+        }
+
         public ContextPackInput {
             recalledMemories = recalledMemories != null ? List.copyOf(recalledMemories) : List.of();
             factHistories = factHistories != null ? List.copyOf(factHistories) : List.of();
             if (tokenBudget <= 0) {
                 tokenBudget = 3000;
             }
+            if (staticImportanceThreshold < 0) {
+                staticImportanceThreshold = DEFAULT_STATIC_IMPORTANCE_THRESHOLD;
+            }
         }
     }
 
+    // ──────────────── Handlebars View Models ────────────────
+
+    public record ProceduralSkillView(
+            String id,
+            String name,
+            String kind,
+            float confidence,
+            String summary,
+            String structured,
+            List<String> tools,
+            boolean hasTools,
+            float score,
+            int valence,
+            String legacyText,
+            boolean isLegacy
+    ) {}
+
+    public record SemanticFactView(
+            String id,
+            String text,
+            List<String> synapticTags,
+            boolean hasTags
+    ) {}
+
+    public record WorkingMemoryView(
+            String id,
+            String text
+    ) {}
+
+    public record EpisodicMemoryView(
+            String id,
+            String text,
+            float ltpAdjustedDecay,
+            float ageDays
+    ) {}
+
+    public record ContextPackModel(
+            String personaId,
+            String profileName,
+            int tokenBudget,
+            List<ProceduralSkillView> proceduralMemories,
+            boolean hasProceduralMemories,
+            List<SemanticFactView> staticSemanticMemories,
+            boolean hasStaticSemanticMemories,
+            String workingIntent,
+            boolean hasWorkingIntent,
+            List<WorkingMemoryView> workingMemories,
+            boolean hasWorkingMemories,
+            List<SemanticFactView> dynamicSemanticMemories,
+            boolean hasDynamicSemanticMemories,
+            List<EpisodicMemoryView> episodicMemories,
+            boolean hasEpisodicMemories,
+            List<FactHistory> factHistories,
+            boolean hasFactHistories
+    ) {}
+
     /**
      * Formats a complete hierarchical context pack adhering to the token budget.
+     *
+     * <p>Backward-compatible: produces the same output as before by concatenating
+     * {@link #formatStaticPrefix} and {@link #formatDynamicTail}.</p>
      *
      * @param input the context pack inputs
      * @return structured markdown string ready for LLM injection
      */
     public static String format(ContextPackInput input) {
         Objects.requireNonNull(input, "input cannot be null");
+        return formatStaticPrefix(input) + formatDynamicTail(input);
+    }
 
+    /**
+     * Renders the <b>static prefix</b> — content stable across turns within a session.
+     *
+     * <p>Renders via {@code /mcp/templates/memory-context-pack-static.hbs}.</p>
+     *
+     * @param input the context pack inputs
+     * @return stable markdown prefix for system prompt caching
+     */
+    public static String formatStaticPrefix(ContextPackInput input) {
+        Objects.requireNonNull(input, "input cannot be null");
+        return McpTemplateEngine.render("memory-context-pack-static", buildModel(input));
+    }
+
+    /**
+     * Renders the <b>dynamic tail</b> — content that varies per turn.
+     *
+     * <p>Renders via {@code /mcp/templates/memory-context-pack-dynamic.hbs}.</p>
+     *
+     * @param input the context pack inputs
+     * @return volatile markdown tail for user-turn injection
+     */
+    public static String formatDynamicTail(ContextPackInput input) {
+        Objects.requireNonNull(input, "input cannot be null");
+        return McpTemplateEngine.render("memory-context-pack-dynamic", buildModel(input));
+    }
+
+    /**
+     * Renders the dual-plane context pack separated by the cache boundary marker.
+     *
+     * <p>Renders via {@code /mcp/templates/memory-context-pack-split.hbs}.</p>
+     *
+     * @param input the context pack inputs
+     * @return markdown with static prefix, cache boundary marker, and dynamic tail
+     */
+    public static String formatSplit(ContextPackInput input) {
+        Objects.requireNonNull(input, "input cannot be null");
+        return McpTemplateEngine.render("memory-context-pack-split", buildModel(input));
+    }
+
+    // ──────────────── Model Building & Budgeting ────────────────
+
+    public static ContextPackModel buildModel(ContextPackInput input) {
         int totalCharBudget = input.tokenBudget() * CHARS_PER_TOKEN;
         int workingBudget = (int) (totalCharBudget * 0.20);
         int proceduralBudget = (int) (totalCharBudget * 0.25);
         int semanticBudget = (int) (totalCharBudget * 0.30);
         int episodicBudget = (int) (totalCharBudget * 0.25);
 
-        // Separate recalled memories by tier
-        List<CognitiveResult> workingMemories = new ArrayList<>();
-        List<CognitiveResult> proceduralMemories = new ArrayList<>();
-        List<CognitiveResult> semanticMemories = new ArrayList<>();
-        List<CognitiveResult> episodicMemories = new ArrayList<>();
+        List<CognitiveResult> workingList = new ArrayList<>();
+        List<CognitiveResult> proceduralList = new ArrayList<>();
+        List<CognitiveResult> staticSemanticList = new ArrayList<>();
+        List<CognitiveResult> dynamicSemanticList = new ArrayList<>();
+        List<CognitiveResult> episodicList = new ArrayList<>();
 
         for (CognitiveResult result : input.recalledMemories()) {
             if (result.memoryType() == MemoryType.WORKING) {
-                workingMemories.add(result);
+                workingList.add(result);
             } else if (result.memoryType() == MemoryType.PROCEDURAL) {
-                proceduralMemories.add(result);
+                proceduralList.add(result);
             } else if (result.memoryType() == MemoryType.SEMANTIC) {
-                semanticMemories.add(result);
-            } else if (result.memoryType() == MemoryType.EPISODIC) {
-                episodicMemories.add(result);
-            }
-        }
-
-        var sb = new StringBuilder();
-        sb.append("# === SPECTOR COGNITIVE CONTEXT PACK ===\n");
-        if (input.personaId() != null && !input.personaId().isBlank()) {
-            sb.append("**Persona:** `").append(input.personaId()).append("` | ");
-        }
-        sb.append("**Profile:** `").append(input.profileName() != null ? input.profileName() : "BALANCED")
-          .append("` | **Budget:** ").append(input.tokenBudget()).append(" tokens\n\n");
-
-        // 1. Working Intent & Scratchpad
-        sb.append("## 1. ACTIVE WORKING INTENT & SCRATCHPAD\n");
-        int workingCharsUsed = 0;
-        if (input.workingIntent() != null && !input.workingIntent().isBlank()) {
-            String line = "- [Turn Intent]: " + input.workingIntent().strip() + "\n";
-            sb.append(line);
-            workingCharsUsed += line.length();
-        }
-        for (CognitiveResult r : workingMemories) {
-            String item = "- [Working #" + r.id() + "]: " + r.text() + "\n";
-            if (workingCharsUsed + item.length() <= workingBudget) {
-                sb.append(item);
-                workingCharsUsed += item.length();
-            }
-        }
-        if (workingCharsUsed == 0) {
-            sb.append("- _No active working scratchpad note._\n");
-        }
-        sb.append("\n");
-
-        // 2. Procedural Heuristics & Cadence
-        sb.append("## 2. PROCEDURAL HEURISTICS & DECISION CADENCE\n");
-        int procCharsUsed = 0;
-        for (CognitiveResult r : proceduralMemories) {
-            SkillBody skillBody = SkillBody.parse(r.text());
-            StringBuilder item = new StringBuilder();
-
-            if (skillBody.hasMeta()) {
-                var meta = skillBody.meta();
-                String kindStr = meta.kind() != null ? meta.kind().name().toLowerCase() : "heuristic";
-                String nameStr = meta.name() != null ? meta.name() : "unnamed";
-                String structured = formatStructuredSkill(skillBody.body());
-                if (!structured.isEmpty()) {
-                    item.append("- [Skill #").append(r.id()).append("] ").append(nameStr)
-                            .append("  (").append(kindStr).append(", conf ")
-                            .append(String.format(java.util.Locale.ROOT, "%.2f", meta.confidence())).append(")\n");
-                    item.append(structured);
+                if (result.importance() >= input.staticImportanceThreshold()) {
+                    staticSemanticList.add(result);
                 } else {
-                    String summary = extractFirstParagraph(skillBody.body());
-                    item.append("- [Skill #").append(r.id()).append("] ").append(nameStr)
-                            .append("  (").append(kindStr).append(", conf ")
-                            .append(String.format(java.util.Locale.ROOT, "%.2f", meta.confidence())).append(")");
-                    if (!summary.isEmpty()) {
-                        item.append(": ").append(summary);
-                    }
-                    item.append("\n");
+                    dynamicSemanticList.add(result);
                 }
-                if (meta.tools() != null && !meta.tools().isEmpty()) {
-                    item.append("  - Tools: [").append(String.join(", ", meta.tools())).append("]\n");
-                }
-            } else {
-                String cleanText = r.text();
-                // Strip raw frontmatter fences if corrupt
-                if (cleanText.stripLeading().startsWith("---")) {
-                    int secondFence = cleanText.indexOf("---", 3);
-                    if (secondFence != -1) {
-                        cleanText = cleanText.substring(secondFence + 3).strip();
-                    }
-                }
-                item.append("- [Skill #").append(r.id()).append("]: ").append(cleanText).append("\n");
+            } else if (result.memoryType() == MemoryType.EPISODIC) {
+                episodicList.add(result);
             }
-
-            item.append("  - Score: ").append(String.format(java.util.Locale.ROOT, "%.2f", r.score()));
-            item.append(" | Valence: ").append(r.valence()).append("\n");
-            if (procCharsUsed + item.length() <= proceduralBudget) {
-                sb.append(item);
-                procCharsUsed += item.length();
-            }
-        }
-        if (procCharsUsed == 0) {
-            sb.append("- _No specialized procedural skill triggered for current context._\n");
-        }
-        sb.append("\n");
-
-        // 3. Core Semantic Facts & Moral Axioms
-        sb.append("## 3. CORE SEMANTIC FACTS & AXIOMS\n");
-        int semCharsUsed = 0;
-        for (CognitiveResult r : semanticMemories) {
-            StringBuilder item = new StringBuilder();
-            item.append("- [Fact #").append(r.id()).append("]: ").append(r.text()).append("\n");
-            if (r.synapticTags() != null && r.synapticTags().length > 0) {
-                item.append("  - Tags: [").append(String.join(", ", r.synapticTags())).append("]\n");
-            }
-            if (semCharsUsed + item.length() <= semanticBudget) {
-                sb.append(item);
-                semCharsUsed += item.length();
-            }
-        }
-        if (semCharsUsed == 0) {
-            sb.append("- _No matching semantic beliefs retrieved._\n");
-        }
-        sb.append("\n");
-
-        // 4. Chrono-Episodic Memories & Anecdotes
-        sb.append("## 4. CHRONO-EPISODIC MEMORIES & EXPERIENCES\n");
-        int epiCharsUsed = 0;
-        for (CognitiveResult r : episodicMemories) {
-            StringBuilder item = new StringBuilder();
-            item.append("- [Episode #").append(r.id()).append("]: ").append(r.text()).append("\n");
-            item.append("  - Confidence: ").append(String.format("%.2f", r.ltpAdjustedDecay()))
-                .append(" | Age: ").append(String.format("%.1f", r.ageDays())).append("d\n");
-            if (epiCharsUsed + item.length() <= episodicBudget) {
-                sb.append(item);
-                epiCharsUsed += item.length();
-            }
-        }
-        if (epiCharsUsed == 0) {
-            sb.append("- _No episodic memories recalled for prompt._\n");
-        }
-        sb.append("\n");
-
-        // 5. Multi-Evidence Transitions & Conflicts (if present)
-        if (!input.factHistories().isEmpty()) {
-            sb.append("## 5. BITEMPORAL EVIDENCE TRANSITIONS & CONFLICTS\n");
-            for (FactHistory fh : input.factHistories()) {
-                sb.append("- [Timeline: `").append(fh.subject()).append("` -> `").append(fh.predicate()).append("`]:\n");
-                if (fh.activeFact() != null) {
-                    sb.append("  - Active Consensus: `").append(fh.activeFact().object())
-                      .append("` (conf: ").append(String.format("%.2f", fh.activeFact().confidence()))
-                      .append(", validFrom: ").append(fh.activeFact().validFrom()).append(")\n");
-                }
-                for (FactHistory.FactSnapshot s : fh.supersededFacts()) {
-                    sb.append("  - Historical: `").append(s.object())
-                      .append("` (conf: ").append(String.format("%.2f", s.confidence()))
-                      .append(", supersededBy: #").append(s.supersededByFactId()).append(")\n");
-                }
-            }
-            sb.append("\n");
         }
 
-        sb.append("# === END COGNITIVE CONTEXT PACK ===\n");
-        return sb.toString();
+        // Budget Procedural
+        List<ProceduralSkillView> budgetedProcedural = new ArrayList<>();
+        int procChars = 0;
+        for (CognitiveResult r : proceduralList) {
+            ProceduralSkillView view = toProceduralSkillView(r);
+            int estLen = estimateProceduralLength(view);
+            if (procChars + estLen <= proceduralBudget) {
+                budgetedProcedural.add(view);
+                procChars += estLen;
+            }
+        }
+
+        // Budget Static Semantic
+        List<SemanticFactView> budgetedStaticSemantic = new ArrayList<>();
+        int staticSemChars = 0;
+        for (CognitiveResult r : staticSemanticList) {
+            SemanticFactView view = toSemanticFactView(r);
+            int estLen = estimateSemanticLength(view);
+            if (staticSemChars + estLen <= semanticBudget) {
+                budgetedStaticSemantic.add(view);
+                staticSemChars += estLen;
+            }
+        }
+
+        // Budget Working
+        List<WorkingMemoryView> budgetedWorking = new ArrayList<>();
+        int workingChars = 0;
+        boolean hasWorkingIntent = input.workingIntent() != null && !input.workingIntent().isBlank();
+        if (hasWorkingIntent) {
+            workingChars += ("- [Turn Intent]: " + input.workingIntent().strip() + "\n").length();
+        }
+        for (CognitiveResult r : workingList) {
+            String item = "- [Working #" + r.id() + "]: " + r.text() + "\n";
+            if (workingChars + item.length() <= workingBudget) {
+                budgetedWorking.add(new WorkingMemoryView(r.id(), r.text()));
+                workingChars += item.length();
+            }
+        }
+
+        // Budget Dynamic Semantic
+        List<SemanticFactView> budgetedDynamicSemantic = new ArrayList<>();
+        int dynamicSemChars = 0;
+        for (CognitiveResult r : dynamicSemanticList) {
+            SemanticFactView view = toSemanticFactView(r);
+            int estLen = estimateSemanticLength(view);
+            if (dynamicSemChars + estLen <= semanticBudget) {
+                budgetedDynamicSemantic.add(view);
+                dynamicSemChars += estLen;
+            }
+        }
+
+        // Budget Episodic
+        List<EpisodicMemoryView> budgetedEpisodic = new ArrayList<>();
+        int epiChars = 0;
+        for (CognitiveResult r : episodicList) {
+            EpisodicMemoryView view = new EpisodicMemoryView(r.id(), r.text(), r.ltpAdjustedDecay(), r.ageDays());
+            int estLen = estimateEpisodicLength(view);
+            if (epiChars + estLen <= episodicBudget) {
+                budgetedEpisodic.add(view);
+                epiChars += estLen;
+            }
+        }
+
+        String profile = input.profileName() != null && !input.profileName().isBlank()
+                ? input.profileName() : "BALANCED";
+
+        return new ContextPackModel(
+                input.personaId(),
+                profile,
+                input.tokenBudget(),
+                budgetedProcedural,
+                !budgetedProcedural.isEmpty(),
+                budgetedStaticSemantic,
+                !budgetedStaticSemantic.isEmpty(),
+                hasWorkingIntent ? input.workingIntent().strip() : null,
+                hasWorkingIntent,
+                budgetedWorking,
+                !budgetedWorking.isEmpty(),
+                budgetedDynamicSemantic,
+                !budgetedDynamicSemantic.isEmpty(),
+                budgetedEpisodic,
+                !budgetedEpisodic.isEmpty(),
+                input.factHistories(),
+                !input.factHistories().isEmpty()
+        );
+    }
+
+    private static ProceduralSkillView toProceduralSkillView(CognitiveResult r) {
+        SkillBody skillBody = SkillBody.parse(r.text());
+        if (skillBody.hasMeta()) {
+            var meta = skillBody.meta();
+            String kindStr = meta.kind() != null ? meta.kind().name().toLowerCase() : "heuristic";
+            String nameStr = meta.name() != null ? meta.name() : "unnamed";
+            String structured = formatStructuredSkill(skillBody.body());
+            String summary = structured.isEmpty() ? extractFirstParagraph(skillBody.body()) : "";
+            List<String> tools = meta.tools() != null ? meta.tools() : List.of();
+            return new ProceduralSkillView(
+                    r.id(), nameStr, kindStr, meta.confidence(),
+                    summary, structured, tools, !tools.isEmpty(),
+                    r.score(), r.valence(), null, false
+            );
+        } else {
+            String cleanText = r.text();
+            if (cleanText != null && cleanText.stripLeading().startsWith("---")) {
+                int secondFence = cleanText.indexOf("---", 3);
+                if (secondFence != -1) {
+                    cleanText = cleanText.substring(secondFence + 3).strip();
+                }
+            }
+            return new ProceduralSkillView(
+                    r.id(), null, null, 0f,
+                    null, null, List.of(), false,
+                    r.score(), r.valence(), cleanText, true
+            );
+        }
+    }
+
+    private static SemanticFactView toSemanticFactView(CognitiveResult r) {
+        List<String> tags = r.synapticTags() != null ? List.of(r.synapticTags()) : List.of();
+        return new SemanticFactView(r.id(), r.text(), tags, !tags.isEmpty());
+    }
+
+    private static int estimateProceduralLength(ProceduralSkillView view) {
+        if (view.isLegacy()) {
+            return (view.legacyText() != null ? view.legacyText().length() : 0) + 40;
+        }
+        int len = (view.name() != null ? view.name().length() : 0) + 50;
+        if (view.structured() != null && !view.structured().isEmpty()) {
+            len += view.structured().length();
+        } else if (view.summary() != null && !view.summary().isEmpty()) {
+            len += view.summary().length() + 2;
+        }
+        if (view.hasTools()) {
+            len += 20 + String.join(", ", view.tools()).length();
+        }
+        return len;
+    }
+
+    private static int estimateSemanticLength(SemanticFactView view) {
+        int len = (view.text() != null ? view.text().length() : 0) + 20;
+        if (view.hasTags()) {
+            len += 15 + String.join(", ", view.synapticTags()).length();
+        }
+        return len;
+    }
+
+    private static int estimateEpisodicLength(EpisodicMemoryView view) {
+        return (view.text() != null ? view.text().length() : 0) + 60;
     }
 
     private static String formatStructuredSkill(final String body) {

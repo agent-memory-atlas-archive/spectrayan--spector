@@ -18,6 +18,7 @@ package com.spectrayan.spector.synapse.memory;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
@@ -26,6 +27,7 @@ import com.spectrayan.spector.cluster.fencing.FenceTokenManager;
 import com.spectrayan.spector.cluster.node.NodeRole;
 import com.spectrayan.spector.cluster.routing.RouteBinding;
 import com.spectrayan.spector.cluster.routing.RoutingKey;
+import com.spectrayan.spector.commons.concurrent.MemoryScope;
 import com.spectrayan.spector.commons.error.ErrorCode;
 import com.spectrayan.spector.commons.error.SpectorValidationException;
 import com.spectrayan.spector.synapse.cluster.exception.NamespaceNotOwnedException;
@@ -53,11 +55,14 @@ import com.spectrayan.spector.synapse.catalog.GrantRole;
 import com.spectrayan.spector.synapse.catalog.NamespaceRecord;
 import com.spectrayan.spector.synapse.catalog.NamespaceStatus;
 import com.spectrayan.spector.synapse.catalog.PrincipalKind;
+import com.spectrayan.spector.synapse.catalog.exception.CrossTenantAccessException;
 import com.spectrayan.spector.synapse.catalog.exception.NamespaceNotFoundException;
 import com.spectrayan.spector.synapse.catalog.exception.NamespaceTombstonedException;
 import com.spectrayan.spector.synapse.catalog.exception.TokenNamespaceLockedException;
 import com.spectrayan.spector.synapse.config.SynapseProperties;
 import com.spectrayan.spector.synapse.identity.IdentityPlane;
+import com.spectrayan.spector.synapse.security.ApiKeyAuthenticationDetails;
+import com.spectrayan.spector.synapse.security.SecurityUtils;
 
 /**
  * Shared binder that resolves an authenticated request to a {@link MemoryBinding}
@@ -304,7 +309,14 @@ public class MemoryRequestBinder {
         }
 
         TokenClaims tokenClaims = extractTokenClaims(auth);
-        Account account = catalog.getOrCreateAccount(accountId, tokenClaims.profile(), tokenClaims.kind());
+        Account account;
+        try {
+            account = catalog.getOrCreateAccount(accountId, tokenClaims.profile(), tokenClaims.kind(), tokenClaims.tenantId());
+        } catch (com.spectrayan.spector.synapse.catalog.exception.TenantReassignmentException tre) {
+            log.warn("[MemoryRequestBinder] Tenant reassignment conflict: account={} token tenant='{}'",
+                    accountId, tokenClaims.tenantId());
+            throw new CrossTenantAccessException(accountId, selector != null && selector.isPresent() ? selector.get() : "default", tre.targetTenantId());
+        }
         if (account == null) {
             account = catalog.getOrCreateAccount(accountId);
         }
@@ -330,11 +342,29 @@ public class MemoryRequestBinder {
 
         validateTokenAllowSets(tokenClaims, targetSlug, targetNamespaceId);
 
-        if (tokenClaims.tenantId() != null && !tokenClaims.tenantId().equals(account.tenantId())) {
+        String effectiveTenantId = tokenClaims.tenantId() != null ? tokenClaims.tenantId() : (account != null ? account.tenantId() : null);
+
+        if (tokenClaims.tenantId() != null && account != null
+                && !tokenClaims.tenantId().equals(account.tenantId())) {
             log.warn("[MemoryRequestBinder] Access denied: token tenantId='{}' does not match account tenantId='{}' for account={}",
                     tokenClaims.tenantId(), account.tenantId(), accountId);
-            throw new com.spectrayan.spector.synapse.catalog.exception.NamespaceAccessDeniedException(
-                    targetNamespaceId, accountId);
+            throw new CrossTenantAccessException(accountId, targetNamespaceId, account.tenantId() != null ? account.tenantId() : "default");
+        }
+
+        if (record != null && !record.ownerAccountId().equals(accountId)) {
+            Account ownerAccount = null;
+            try {
+                ownerAccount = catalog.getAccount(record.ownerAccountId());
+            } catch (Exception ignored) {}
+            if (ownerAccount != null) {
+                String callerTenant = effectiveTenantId != null ? effectiveTenantId : (account != null ? account.tenantId() : null);
+                String ownerTenant = ownerAccount.tenantId();
+                if (!java.util.Objects.equals(callerTenant, ownerTenant) && (callerTenant != null || ownerTenant != null)) {
+                    log.warn("[MemoryRequestBinder] Cross-tenant access denied: account={} (tenant={}) attempted access to namespace={} owned by account={} (tenant={})",
+                            accountId, callerTenant, targetNamespaceId, record.ownerAccountId(), ownerTenant);
+                    throw new CrossTenantAccessException(accountId, targetNamespaceId, ownerTenant != null ? ownerTenant : "default");
+                }
+            }
         }
 
         Optional<com.spectrayan.spector.synapse.catalog.Grant> authGrant =
@@ -349,9 +379,10 @@ public class MemoryRequestBinder {
 
         NamespaceResolver resolver = registry.namespaceResolver();
         String ownerAccountId = record != null ? record.ownerAccountId() : accountId;
-        String routingTenantId = (resolver != null)
+        String resolvedTenant = (resolver != null)
                 ? resolver.placementTenantIdFor(targetNamespaceId, ownerAccountId, accountId, account)
-                : (account != null ? account.tenantId() : null);
+                : null;
+        String routingTenantId = resolvedTenant != null ? resolvedTenant : effectiveTenantId;
 
         String cellId = synapseProps != null && synapseProps.cell() != null ? synapseProps.cell().getId() : null;
         RoutingKey routingKey = new RoutingKey(cellId, routingTenantId, targetNamespaceId);
@@ -392,7 +423,7 @@ public class MemoryRequestBinder {
             SoulContext primarySoul = identityPlane != null
                     ? identityPlane.primarySoulFor(accountId).orElse(null) : null;
             List<SoulContext> soulStack = identityPlane != null
-                    ? identityPlane.soulsFor(tokenClaims.tenantId(), effectiveOrgs, accountId)
+                    ? identityPlane.soulsFor(effectiveTenantId, effectiveOrgs, accountId)
                     : List.of();
 
             com.spectrayan.spector.memory.model.SalienceProfile salience = identityPlane != null
@@ -403,7 +434,7 @@ public class MemoryRequestBinder {
             }
 
             RequestMemoryContext requestContext = new RequestMemoryContext(
-                    tokenClaims.tenantId(),
+                    effectiveTenantId,
                     effectiveOrgs,
                     accountId,
                     targetNamespaceId,
@@ -455,18 +486,27 @@ public class MemoryRequestBinder {
     }
 
     private TokenClaims extractTokenClaims(Authentication auth) {
+        String tenantId = SecurityUtils.extractTenantFromAuthentication(auth);
+
+        if ((tenantId == null || tenantId.isBlank()) && MemoryScope.isTenantActive()) {
+            String scoped = MemoryScope.tenantId();
+            if (scoped != null && !scoped.isBlank() && !"default".equals(scoped)) {
+                tenantId = scoped;
+            }
+        }
+
         Jwt jwt = null;
         if (auth instanceof JwtAuthenticationToken jwtAuth) {
             jwt = jwtAuth.getToken();
-        } else if (auth.getPrincipal() instanceof Jwt principalJwt) {
+        } else if (auth != null && auth.getPrincipal() instanceof Jwt principalJwt) {
             jwt = principalJwt;
-        } else if (auth.getCredentials() instanceof Jwt credJwt) {
+        } else if (auth != null && auth.getCredentials() instanceof Jwt credJwt) {
             jwt = credJwt;
         }
+
         if (jwt == null) {
-            return new TokenClaims(null, List.of(), Set.of(), null, null, AccountProfile.HUMAN_SOLO, PrincipalKind.HUMAN);
+            return new TokenClaims(tenantId, List.of(), Set.of(), null, null, AccountProfile.HUMAN_SOLO, PrincipalKind.HUMAN);
         }
-        String tenantId = jwt.getClaimAsString("tid");
         List<String> orgUnitIds = jwt.getClaimAsStringList("org");
         if (orgUnitIds == null) {
             orgUnitIds = List.of();

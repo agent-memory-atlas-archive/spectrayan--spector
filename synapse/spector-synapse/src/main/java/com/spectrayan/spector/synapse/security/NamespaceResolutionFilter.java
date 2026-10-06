@@ -29,8 +29,11 @@ import org.springframework.web.context.request.RequestAttributes;
 import org.springframework.web.context.request.RequestContextHolder;
 import org.springframework.web.filter.OncePerRequestFilter;
 
+import com.spectrayan.spector.commons.concurrent.MemoryScope;
+import com.spectrayan.spector.synapse.catalog.exception.CrossTenantAccessException;
 import com.spectrayan.spector.synapse.memory.MemoryBinding;
 import com.spectrayan.spector.synapse.memory.MemoryRequestBinder;
+import org.springframework.http.MediaType;
 
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
@@ -81,6 +84,7 @@ public class NamespaceResolutionFilter extends OncePerRequestFilter {
                 : (paramNamespace != null && !paramNamespace.isBlank() ? paramNamespace.trim() : null);
 
         Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        String initialTenantId = SecurityUtils.getTenantId();
         MemoryBinding binding = null;
 
         try {
@@ -92,11 +96,59 @@ public class NamespaceResolutionFilter extends OncePerRequestFilter {
                 attrs.setAttribute(MemoryBinding.ATTRIBUTE_KEY, binding, RequestAttributes.SCOPE_REQUEST);
             }
 
-            filterChain.doFilter(request, response);
+            String effectiveTenantId = (binding.context() != null && binding.context().tenantId() != null)
+                    ? binding.context().tenantId()
+                    : initialTenantId;
+            String sessionId = binding.context() != null ? binding.context().sessionId() : null;
+            String namespaceId = binding.namespaceId();
+
+            MemoryScope.runWithScope(effectiveTenantId, sessionId, namespaceId, () -> {
+                try {
+                    filterChain.doFilter(request, response);
+                } catch (IOException | ServletException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+        } catch (CrossTenantAccessException e) {
+            writeCrossTenantDenied(response, e);
+        } catch (RuntimeException e) {
+            if (e.getCause() instanceof CrossTenantAccessException ctae) {
+                writeCrossTenantDenied(response, ctae);
+                return;
+            }
+            if (e.getCause() instanceof ServletException servletException) {
+                if (servletException.getCause() instanceof CrossTenantAccessException ctae) {
+                    writeCrossTenantDenied(response, ctae);
+                    return;
+                }
+                throw servletException;
+            }
+            if (e.getCause() instanceof IOException ioException) {
+                throw ioException;
+            }
+            throw e;
         } finally {
             if (binding != null) {
                 binder.unbind(binding);
             }
         }
+    }
+
+    private void writeCrossTenantDenied(HttpServletResponse response, CrossTenantAccessException e) throws IOException {
+        log.warn("[NamespaceResolutionFilter] Cross-tenant access denied: {}", e.getMessage());
+        response.setStatus(HttpServletResponse.SC_FORBIDDEN);
+        response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+        response.setCharacterEncoding(java.nio.charset.StandardCharsets.UTF_8.name());
+        String errorCodeId = e.errorCode() != null ? e.errorCode().id() : "SPE-820-001";
+        String alias = CrossTenantAccessException.ERROR_CODE_ALIAS;
+        String msg = e.getMessage() != null
+                ? e.getMessage().replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r")
+                : "Cross-tenant access denied";
+        String isoTimestamp = java.time.format.DateTimeFormatter.ISO_INSTANT.format(java.time.Instant.now());
+        String json = String.format(
+                "{\"status\":403,\"error\":\"%s\",\"code\":\"%s\",\"alias\":\"%s\",\"message\":\"%s\",\"timestamp\":\"%s\",\"details\":{\"alias\":\"%s\",\"code\":\"%s\"}}",
+                errorCodeId, errorCodeId, alias, msg, isoTimestamp, alias, errorCodeId
+        );
+        response.getWriter().write(json);
     }
 }

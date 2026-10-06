@@ -75,6 +75,7 @@ public class GlobalExceptionHandler {
         HttpStatus status = switch (code.category()) {
             case VALIDATION -> HttpStatus.BAD_REQUEST;
             case CONFIG -> HttpStatus.UNPROCESSABLE_ENTITY;
+            case SECURITY -> HttpStatus.FORBIDDEN;
             case CONNECTOR -> (code == ErrorCode.CONNECTOR_ROUTE_NOT_FOUND ||
                                code == ErrorCode.CONNECTOR_TEMPLATE_NOT_FOUND)
                     ? HttpStatus.NOT_FOUND
@@ -82,7 +83,7 @@ public class GlobalExceptionHandler {
             case INGESTION -> HttpStatus.BAD_REQUEST;
             case NAMESPACE -> switch (code) {
                 case NAMESPACE_NOT_FOUND, NAMESPACE_TOMBSTONED -> HttpStatus.NOT_FOUND;
-                case NAMESPACE_ACCESS_DENIED, TOKEN_NAMESPACE_LOCKED, FEDERATION_DISABLED, IDENTITY_REGION_DENIED -> HttpStatus.FORBIDDEN;
+                case NAMESPACE_ACCESS_DENIED, TOKEN_NAMESPACE_LOCKED, FEDERATION_DISABLED, IDENTITY_REGION_DENIED, CROSS_TENANT_ACCESS_DENIED -> HttpStatus.FORBIDDEN;
                 case DEFAULT_NAMESPACE_PROTECTED, NAMESPACE_LEGAL_HOLD -> HttpStatus.CONFLICT;
                 case NAMESPACE_QUOTA_EXCEEDED, ACCOUNT_QUOTA_EXCEEDED, TENANT_QUOTA_EXCEEDED, NAMESPACE_HOT_CAP_EXCEEDED -> HttpStatus.TOO_MANY_REQUESTS;
                 case SOUL_STACK_UNAVAILABLE -> HttpStatus.SERVICE_UNAVAILABLE;
@@ -103,6 +104,11 @@ public class GlobalExceptionHandler {
             details = nnoe.details();
         } else if (ex instanceof StaleRouteException sre) {
             details = sre.details();
+        } else if (ex instanceof com.spectrayan.spector.synapse.catalog.exception.CrossTenantAccessException) {
+            details = Map.of(
+                    "alias", com.spectrayan.spector.synapse.catalog.exception.CrossTenantAccessException.ERROR_CODE_ALIAS,
+                    "code", code.id()
+            );
         }
         log.warn("[SynapseException] [{}] status={} message={}", code.id(), status.value(), ex.getMessage());
         var responseBuilder = ResponseEntity.status(status)
@@ -122,11 +128,20 @@ public class GlobalExceptionHandler {
         HttpStatus status = switch (code.category()) {
             case VALIDATION -> HttpStatus.BAD_REQUEST;
             case CONFIG -> HttpStatus.UNPROCESSABLE_ENTITY;
+            case SECURITY -> HttpStatus.FORBIDDEN;
             case CONNECTOR -> (code == ErrorCode.CONNECTOR_ROUTE_NOT_FOUND ||
                                code == ErrorCode.CONNECTOR_TEMPLATE_NOT_FOUND)
                     ? HttpStatus.NOT_FOUND
                     : HttpStatus.BAD_REQUEST;
             case INGESTION -> HttpStatus.BAD_REQUEST;
+            case NAMESPACE -> switch (code) {
+                case NAMESPACE_NOT_FOUND, NAMESPACE_TOMBSTONED -> HttpStatus.NOT_FOUND;
+                case NAMESPACE_ACCESS_DENIED, TOKEN_NAMESPACE_LOCKED, FEDERATION_DISABLED, IDENTITY_REGION_DENIED, CROSS_TENANT_ACCESS_DENIED -> HttpStatus.FORBIDDEN;
+                case DEFAULT_NAMESPACE_PROTECTED, NAMESPACE_LEGAL_HOLD -> HttpStatus.CONFLICT;
+                case NAMESPACE_QUOTA_EXCEEDED, ACCOUNT_QUOTA_EXCEEDED, TENANT_QUOTA_EXCEEDED, NAMESPACE_HOT_CAP_EXCEEDED -> HttpStatus.TOO_MANY_REQUESTS;
+                case SOUL_STACK_UNAVAILABLE -> HttpStatus.SERVICE_UNAVAILABLE;
+                default -> HttpStatus.BAD_REQUEST;
+            };
             case CLUSTER -> switch (code) {
                 case NAMESPACE_NOT_OWNED, STALE_ROUTE -> HttpStatus.MISDIRECTED_REQUEST;
                 case FENCED -> HttpStatus.CONFLICT;

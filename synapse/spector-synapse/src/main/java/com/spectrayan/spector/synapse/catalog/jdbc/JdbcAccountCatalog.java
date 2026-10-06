@@ -361,6 +361,13 @@ public class JdbcAccountCatalog implements AccountCatalog {
             if (record.status() == NamespaceStatus.TOMBSTONED) {
                 return Optional.empty();
             }
+            Account caller = findAccountById(accountId).orElse(null);
+            Account owner = findAccountById(record.ownerAccountId()).orElse(null);
+            String callerTenant = caller != null ? caller.tenantId() : null;
+            String ownerTenant = owner != null ? owner.tenantId() : null;
+            if (!Objects.equals(callerTenant, ownerTenant) && (callerTenant != null || ownerTenant != null)) {
+                throw new CrossTenantAccessException(accountId, record.namespaceId(), ownerTenant != null ? ownerTenant : "default");
+            }
             // Check if accessible to this account (owned or granted)
             if (record.ownerAccountId().equals(accountId) || hasActiveGrant(accountId, record.namespaceId())) {
                 return Optional.of(record);
@@ -374,13 +381,23 @@ public class JdbcAccountCatalog implements AccountCatalog {
     public List<NamespaceRecord> listAccessible(String accountId) {
         Objects.requireNonNull(accountId, "accountId must not be null");
         // Ensure account default namespace is provisioned
-        getOrCreateAccount(accountId);
+        Account caller = getOrCreateAccount(accountId);
 
         String sql = sqlLoader.load("catalog/namespaces/list-accessible");
-        return jdbc.sql(sql)
+        List<NamespaceRecord> records = jdbc.sql(sql)
                 .param("accountId", accountId)
                 .query(this::mapNamespaceRow)
                 .list();
+
+        String callerTenant = caller.tenantId();
+        return records.stream().filter(rec -> {
+            if (rec.ownerAccountId().equals(accountId)) {
+                return true;
+            }
+            Account owner = findAccountById(rec.ownerAccountId()).orElse(null);
+            String ownerTenant = owner != null ? owner.tenantId() : null;
+            return Objects.equals(callerTenant, ownerTenant);
+        }).toList();
     }
 
     @Override
@@ -636,6 +653,14 @@ public class JdbcAccountCatalog implements AccountCatalog {
             throw new NamespaceAccessDeniedException(record.namespaceId(), callerAccountId);
         }
 
+        Account callerAccount = getAccount(callerAccountId);
+        Account granteeAccount = getAccount(granteeAccountId);
+        String callerTenant = callerAccount != null ? callerAccount.tenantId() : null;
+        String granteeTenant = granteeAccount != null ? granteeAccount.tenantId() : null;
+        if (!Objects.equals(callerTenant, granteeTenant) && (callerTenant != null || granteeTenant != null)) {
+            throw new CrossTenantAccessException(granteeAccountId, record.namespaceId(), callerTenant != null ? callerTenant : "default");
+        }
+
         Grant grant = new Grant(
                 tsid.generate(),
                 GrantObjectType.NAMESPACE,
@@ -750,6 +775,15 @@ public class JdbcAccountCatalog implements AccountCatalog {
 
         for (Grant grant : grants) {
             if (grant.role() != null && grant.role().ordinal() <= minimumRole.ordinal()) {
+                if (ns.isPresent()) {
+                    Account caller = findAccountById(accountId).orElse(null);
+                    Account owner = findAccountById(ns.get().ownerAccountId()).orElse(null);
+                    String callerTenant = caller != null ? caller.tenantId() : null;
+                    String ownerTenant = owner != null ? owner.tenantId() : null;
+                    if (!Objects.equals(callerTenant, ownerTenant) && (callerTenant != null || ownerTenant != null)) {
+                        throw new CrossTenantAccessException(accountId, namespaceId, ownerTenant != null ? ownerTenant : "default");
+                    }
+                }
                 if (cache != null) {
                     cache.put(cacheKey, grant);
                 }

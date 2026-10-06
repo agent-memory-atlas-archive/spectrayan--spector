@@ -16,6 +16,7 @@
 package com.spectrayan.spector.synapse.security;
 
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import org.junit.jupiter.api.AfterEach;
@@ -226,10 +227,353 @@ class SecurityUtilsTest {
     }
 
     @Test
-    void getTenantIdIsAlwaysDefaultWhenAuthenticated() {
+    void getTenantIdIsAlwaysDefaultWhenAuthenticatedWithoutTenant() {
         bind(authenticated(TSID, "SCOPE_memory:read"));
 
         assertThat(SecurityUtils.getTenantId()).isEqualTo("default");
+    }
+
+    @Test
+    void getTenantIdResolvesFromMemoryScope() {
+        com.spectrayan.spector.commons.concurrent.MemoryScope.runWithScope(
+                "tenant-alpha", "session-1", "ns-1", () -> {
+                    assertThat(SecurityUtils.getTenantId()).isEqualTo("tenant-alpha");
+                });
+    }
+
+    @Test
+    void getTenantIdResolvesFromApiKeyAuthenticationDetails() {
+        var token = new UsernamePasswordAuthenticationToken(TSID, "credentials", List.of());
+        token.setDetails(new ApiKeyAuthenticationDetails("key-123", "tenant-bravo"));
+        bind(token);
+
+        assertThat(SecurityUtils.getTenantId()).isEqualTo("tenant-bravo");
+    }
+
+    @Test
+    void getTenantIdResolvesFromJwtDefaultClaims() {
+        var jwt = org.springframework.security.oauth2.jwt.Jwt.withTokenValue("mock-token")
+                .header("alg", "none")
+                .claim("sub", TSID)
+                .claim("tenant_id", "tenant-jwt-1")
+                .build();
+        var jwtAuth = new org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken(jwt, List.of());
+        bind(jwtAuth);
+
+        assertThat(SecurityUtils.getTenantId()).isEqualTo("tenant-jwt-1");
+    }
+
+    @Test
+    void getTenantIdResolvesFromConfiguredOidcTenantClaim() {
+        try {
+            SecurityUtils.setOidcTenantClaim("custom_tenant_claim");
+            var jwt = org.springframework.security.oauth2.jwt.Jwt.withTokenValue("mock-token")
+                    .header("alg", "none")
+                    .claim("sub", TSID)
+                    .claim("custom_tenant_claim", "tenant-custom-oidc")
+                    .claim("tenant_id", "fallback-tenant")
+                    .build();
+            var jwtAuth = new org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken(jwt, List.of());
+            bind(jwtAuth);
+
+            assertThat(SecurityUtils.getTenantId()).isEqualTo("tenant-custom-oidc");
+        } finally {
+            SecurityUtils.setOidcTenantClaim(null);
+        }
+    }
+
+    @Test
+    void getTenantIdResolvesFromNumericClaim() {
+        var jwt = org.springframework.security.oauth2.jwt.Jwt.withTokenValue("mock-token")
+                .header("alg", "none")
+                .claim("sub", TSID)
+                .claim("tenant_id", 1001)
+                .build();
+        var jwtAuth = new org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken(jwt, List.of());
+        bind(jwtAuth);
+
+        assertThat(SecurityUtils.getTenantId()).isEqualTo("1001");
+    }
+
+    @Test
+    void getTenantIdResolvesFromNestedJsonClaim() {
+        try {
+            SecurityUtils.setOidcTenantClaim("realm_access.tenant_id");
+            var jwt = org.springframework.security.oauth2.jwt.Jwt.withTokenValue("mock-token")
+                    .header("alg", "none")
+                    .claim("sub", TSID)
+                    .claim("realm_access", java.util.Map.of("tenant_id", "tenant-nested"))
+                    .build();
+            var jwtAuth = new org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken(jwt, List.of());
+            bind(jwtAuth);
+
+            assertThat(SecurityUtils.getTenantId()).isEqualTo("tenant-nested");
+        } finally {
+            SecurityUtils.setOidcTenantClaim(null);
+        }
+    }
+
+    @Test
+    void getTenantIdResolvesFromWhitespacePaddedClaim() {
+        var jwt = org.springframework.security.oauth2.jwt.Jwt.withTokenValue("mock-token")
+                .header("alg", "none")
+                .claim("sub", TSID)
+                .claim("tenant_id", "   tenant-spaced   ")
+                .build();
+        var jwtAuth = new org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken(jwt, List.of());
+        bind(jwtAuth);
+
+        assertThat(SecurityUtils.getTenantId()).isEqualTo("tenant-spaced");
+    }
+
+    @Test
+    void getTenantIdFallsBackWhenCandidateClaimIsBlank() {
+        var jwt = org.springframework.security.oauth2.jwt.Jwt.withTokenValue("mock-token")
+                .header("alg", "none")
+                .claim("sub", TSID)
+                .claim("tenant_id", "   ")
+                .claim("tid", "tenant-tid-fallback")
+                .build();
+        var jwtAuth = new org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken(jwt, List.of());
+        bind(jwtAuth);
+
+        assertThat(SecurityUtils.getTenantId()).isEqualTo("tenant-tid-fallback");
+    }
+
+    @Test
+    void getTenantIdResolvesFromListClaim() {
+        var jwt = org.springframework.security.oauth2.jwt.Jwt.withTokenValue("mock-token")
+                .header("alg", "none")
+                .claim("sub", TSID)
+                .claim("tenant_id", List.of("tenant-list-primary", "tenant-list-secondary"))
+                .build();
+        var jwtAuth = new org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken(jwt, List.of());
+        bind(jwtAuth);
+
+        assertThat(SecurityUtils.getTenantId()).isEqualTo("tenant-list-primary");
+    }
+
+    @Test
+    void getTenantIdFallsBackWhenListClaimIsEmptyOrAllBlank() {
+        var jwt = org.springframework.security.oauth2.jwt.Jwt.withTokenValue("mock-token")
+                .header("alg", "none")
+                .claim("sub", TSID)
+                .claim("tenant_id", List.of("", "   "))
+                .claim("tid", "tenant-tid-after-empty-list")
+                .build();
+        var jwtAuth = new org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken(jwt, List.of());
+        bind(jwtAuth);
+
+        assertThat(SecurityUtils.getTenantId()).isEqualTo("tenant-tid-after-empty-list");
+    }
+
+    @Test
+    void getTenantIdResolvesFromArrayClaim() {
+        var jwt = org.springframework.security.oauth2.jwt.Jwt.withTokenValue("mock-token")
+                .header("alg", "none")
+                .claim("sub", TSID)
+                .claim("tenant_id", new String[] {"tenant-array-1", "tenant-array-2"})
+                .build();
+        var jwtAuth = new org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken(jwt, List.of());
+        bind(jwtAuth);
+
+        assertThat(SecurityUtils.getTenantId()).isEqualTo("tenant-array-1");
+    }
+
+    @Test
+    void getTenantIdResolvesFromNestedListClaim() {
+        try {
+            SecurityUtils.setOidcTenantClaim("realm_access.tenants");
+            var jwt = org.springframework.security.oauth2.jwt.Jwt.withTokenValue("mock-token")
+                    .header("alg", "none")
+                    .claim("sub", TSID)
+                    .claim("realm_access", java.util.Map.of("tenants", List.of("tenant-nested-in-list")))
+                    .build();
+            var jwtAuth = new org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken(jwt, List.of());
+            bind(jwtAuth);
+
+            assertThat(SecurityUtils.getTenantId()).isEqualTo("tenant-nested-in-list");
+        } finally {
+            SecurityUtils.setOidcTenantClaim(null);
+        }
+    }
+
+    @Test
+    void getTenantIdResolvesFromLeafMapClaim() {
+        try {
+            SecurityUtils.setOidcTenantClaim("tenant_map");
+            var jwt = org.springframework.security.oauth2.jwt.Jwt.withTokenValue("mock-token")
+                    .header("alg", "none")
+                    .claim("sub", TSID)
+                    .claim("tenant_map", java.util.Map.of("id", "tenant-map-extracted"))
+                    .build();
+            var jwtAuth = new org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken(jwt, List.of());
+            bind(jwtAuth);
+
+            assertThat(SecurityUtils.getTenantId()).isEqualTo("tenant-map-extracted");
+        } finally {
+            SecurityUtils.setOidcTenantClaim(null);
+        }
+    }
+
+    @Test
+    void getTenantIdResolvesFromIndexedPathClaim() {
+        try {
+            SecurityUtils.setOidcTenantClaim("organizations.0.tenant_id");
+            var jwt = org.springframework.security.oauth2.jwt.Jwt.withTokenValue("mock-token")
+                    .header("alg", "none")
+                    .claim("sub", TSID)
+                    .claim("organizations", List.of(java.util.Map.of("tenant_id", "org-tenant-indexed")))
+                    .build();
+            var jwtAuth = new org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken(jwt, List.of());
+            bind(jwtAuth);
+
+            assertThat(SecurityUtils.getTenantId()).isEqualTo("org-tenant-indexed");
+        } finally {
+            SecurityUtils.setOidcTenantClaim(null);
+        }
+    }
+
+    @Test
+    void getTenantIdResolvesFromDetailsMapWithList() {
+        var token = new UsernamePasswordAuthenticationToken(TSID, "credentials", List.of());
+        token.setDetails(java.util.Map.of("tenant_id", List.of("tenant-details-list")));
+        bind(token);
+
+        assertThat(SecurityUtils.getTenantId()).isEqualTo("tenant-details-list");
+    }
+
+    @Test
+    void getTenantIdResolvesFromPrincipalMethodReflection() {
+        record CustomPrincipal(String name, String tenantId) {}
+        var principal = new CustomPrincipal("custom-user", "tenant-principal-reflection");
+        var token = new UsernamePasswordAuthenticationToken(principal, "credentials", List.of());
+        bind(token);
+
+        assertThat(SecurityUtils.getTenantId()).isEqualTo("tenant-principal-reflection");
+    }
+
+    @Test
+    void getTenantIdResolvesFromSystemPropertyOidcClaim() {
+        String propKey = com.spectrayan.spector.config.SpectorPropertyConstants.AUTH_OIDC_TENANT_CLAIM;
+        String oldVal = System.getProperty(propKey);
+        try {
+            SecurityUtils.setOidcTenantClaim(null);
+            System.setProperty(propKey, "sys_prop_tenant_claim");
+            assertThat(SecurityUtils.getOidcTenantClaim()).isEqualTo("sys_prop_tenant_claim");
+
+            var jwt = org.springframework.security.oauth2.jwt.Jwt.withTokenValue("mock-token")
+                    .header("alg", "none")
+                    .claim("sub", TSID)
+                    .claim("sys_prop_tenant_claim", "tenant-from-sysprop")
+                    .build();
+            var jwtAuth = new org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken(jwt, List.of());
+            bind(jwtAuth);
+
+            assertThat(SecurityUtils.getTenantId()).isEqualTo("tenant-from-sysprop");
+        } finally {
+            if (oldVal != null) {
+                System.setProperty(propKey, oldVal);
+            } else {
+                System.clearProperty(propKey);
+            }
+            SecurityUtils.setOidcTenantClaim(null);
+        }
+    }
+
+    @Test
+    void getTenantIdResolvesFromDetailsNestedDotPath() {
+        var token = new UsernamePasswordAuthenticationToken(TSID, "credentials", List.of());
+        token.setDetails(Map.of("realm_access", Map.of("tenant_id", "nested-details-tenant")));
+        bind(token);
+
+        assertThat(SecurityUtils.getTenantId()).isEqualTo("nested-details-tenant");
+    }
+
+    @Test
+    void getTenantIdResolvesFromPrincipalAttributesMap() {
+        record MockOAuth2Principal(String name, Map<String, Object> attributes) {
+            public Map<String, Object> getAttributes() {
+                return attributes;
+            }
+        }
+        var principal = new MockOAuth2Principal("oauth2-user", Map.of("tenant_id", "oauth2-attr-tenant"));
+        var token = new UsernamePasswordAuthenticationToken(principal, "credentials", List.of());
+        bind(token);
+
+        assertThat(SecurityUtils.getTenantId()).isEqualTo("oauth2-attr-tenant");
+    }
+
+    @Test
+    void getTenantIdResolvesFromPrincipalClaimsMap() {
+        record MockOidcPrincipal(String name, Map<String, Object> claims) {
+            public Map<String, Object> getClaims() {
+                return claims;
+            }
+        }
+        var principal = new MockOidcPrincipal("oidc-user", Map.of("tid", "oidc-claim-tenant"));
+        var token = new UsernamePasswordAuthenticationToken(principal, "credentials", List.of());
+        bind(token);
+
+        assertThat(SecurityUtils.getTenantId()).isEqualTo("oidc-claim-tenant");
+    }
+
+    @Test
+    void getTenantIdResolvesFromPrincipalMap() {
+        Map<String, Object> principalMap = Map.of("tenant_id", "map-principal-tenant");
+        var token = new UsernamePasswordAuthenticationToken(principalMap, "credentials", List.of());
+        bind(token);
+
+        assertThat(SecurityUtils.getTenantId()).isEqualTo("map-principal-tenant");
+    }
+
+    @Test
+    void getTenantIdResolvesFromSingleEntryMapLeaf() {
+        try {
+            SecurityUtils.setOidcTenantClaim("tenant_object");
+            var jwt = org.springframework.security.oauth2.jwt.Jwt.withTokenValue("mock-token")
+                    .header("alg", "none")
+                    .claim("sub", TSID)
+                    .claim("tenant_object", Map.of("custom_key", "single-entry-tenant"))
+                    .build();
+            var jwtAuth = new org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken(jwt, List.of());
+            bind(jwtAuth);
+
+            assertThat(SecurityUtils.getTenantId()).isEqualTo("single-entry-tenant");
+        } finally {
+            SecurityUtils.setOidcTenantClaim(null);
+        }
+    }
+
+    @Test
+    void getTenantIdResolvesFromAuthenticationReflection() {
+        class CustomAuthToken extends UsernamePasswordAuthenticationToken {
+            private final String tenant;
+            CustomAuthToken(String tenant) {
+                super(TSID, "credentials", List.of());
+                this.tenant = tenant;
+            }
+            public String getTenantId() {
+                return tenant;
+            }
+        }
+        bind(new CustomAuthToken("auth-reflection-tenant"));
+
+        assertThat(SecurityUtils.getTenantId()).isEqualTo("auth-reflection-tenant");
+    }
+
+    @Test
+    void getTenantIdIgnoresBooleanValuesInClaims() {
+        var jwt = org.springframework.security.oauth2.jwt.Jwt.withTokenValue("mock-token")
+                .header("alg", "none")
+                .claim("sub", TSID)
+                .claim("tenant_id", Boolean.TRUE)
+                .claim("tid", "fallback-after-bool")
+                .build();
+        var jwtAuth = new org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken(jwt, List.of());
+        bind(jwtAuth);
+
+        assertThat(SecurityUtils.getTenantId()).isEqualTo("fallback-after-bool");
     }
 
     @Test

@@ -55,6 +55,9 @@ public final class SecurityUtils {
     /** Prefix Spring Security applies to scope authorities. */
     private static final String SCOPE_PREFIX = "SCOPE_";
 
+    /** Prefix Spring Security applies to role authorities. */
+    private static final String ROLE_PREFIX = "ROLE_";
+
     private SecurityUtils() {}
 
     /**
@@ -94,8 +97,10 @@ public final class SecurityUtils {
                 continue;
             }
             String value = authority.getAuthority();
-            if (value != null && value.startsWith(SCOPE_PREFIX)) {
-                scopes.add(value.substring(SCOPE_PREFIX.length()));
+            if (value != null) {
+                if (value.regionMatches(true, 0, SCOPE_PREFIX, 0, 6) || value.regionMatches(true, 0, "SCOPE-", 0, 6)) {
+                    scopes.add(value.substring(6).trim());
+                }
             }
         }
         return Collections.unmodifiableSet(scopes);
@@ -110,10 +115,97 @@ public final class SecurityUtils {
      *         scope is {@code null} or the request is anonymous
      */
     public static boolean hasScope(String scope) {
-        if (scope == null) {
+        if (scope == null || scope.isBlank()) {
             return false;
         }
-        return getScopes().contains(scope);
+        String s = scope.trim();
+        if (s.regionMatches(true, 0, SCOPE_PREFIX, 0, 6) || s.regionMatches(true, 0, "SCOPE-", 0, 6)) {
+            s = s.substring(6).trim();
+        }
+        Set<String> scopes = getScopes();
+        if (scopes.contains(s)) {
+            return true;
+        }
+        if (s.startsWith(com.spectrayan.spector.commons.security.SpectorScopes.PREFIX)) {
+            return scopes.contains(s.substring(com.spectrayan.spector.commons.security.SpectorScopes.PREFIX.length()));
+        } else {
+            return scopes.contains(com.spectrayan.spector.commons.security.SpectorScopes.PREFIX + s);
+        }
+    }
+
+    /**
+     * Returns the role authorities granted to the current principal, with the
+     * {@code ROLE_} prefix stripped.
+     *
+     * @return an immutable set of role names; empty when unauthenticated.
+     */
+    public static Set<String> getRoles() {
+        Authentication auth = currentAuthentication();
+        if (auth == null) {
+            return Collections.emptySet();
+        }
+        Set<String> roles = new LinkedHashSet<>();
+        for (GrantedAuthority authority : auth.getAuthorities()) {
+            if (authority == null) {
+                continue;
+            }
+            String value = authority.getAuthority();
+            if (value != null) {
+                if (value.regionMatches(true, 0, ROLE_PREFIX, 0, 5) || value.regionMatches(true, 0, "ROLE-", 0, 5)) {
+                    roles.add(value.substring(5).trim());
+                }
+            }
+        }
+        return Collections.unmodifiableSet(roles);
+    }
+
+    /**
+     * Tests whether the current principal holds the given role (case, delimiter, and camelCase-insensitive).
+     *
+     * @param role the role name (e.g. "admin", "super-admin", "SuperAdmin")
+     * @return {@code true} if present, {@code false} otherwise
+     */
+    public static boolean hasRole(String role) {
+        if (role == null || role.isBlank()) {
+            return false;
+        }
+        Set<String> roles = getRoles();
+        if (roles.contains(role) || roles.contains(role.toLowerCase()) || roles.contains(role.toUpperCase())) {
+            return true;
+        }
+        String cleanRole = role.trim();
+        if (cleanRole.regionMatches(true, 0, "ROLE_", 0, 5) || cleanRole.regionMatches(true, 0, "ROLE-", 0, 5)) {
+            cleanRole = cleanRole.substring(5).trim();
+        }
+        String normalized = cleanRole.replaceAll("(?<=[a-z0-9])(?=[A-Z])", "-").toLowerCase().replace('_', '-');
+        for (String r : roles) {
+            if (r.equalsIgnoreCase(role) || r.equalsIgnoreCase(cleanRole)) {
+                return true;
+            }
+            String cleanR = r.trim();
+            if (cleanR.regionMatches(true, 0, "ROLE_", 0, 5) || cleanR.regionMatches(true, 0, "ROLE-", 0, 5)) {
+                cleanR = cleanR.substring(5).trim();
+            }
+            String normR = cleanR.replaceAll("(?<=[a-z0-9])(?=[A-Z])", "-").toLowerCase().replace('_', '-');
+            if (normR.equals(normalized)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Tests whether the current principal is a Platform Operator (super-admin).
+     */
+    public static boolean isSuperAdmin() {
+        return hasRole(com.spectrayan.spector.commons.security.SpectorRoles.SUPER_ADMIN);
+    }
+
+    /**
+     * Tests whether the current principal is a Tenant Admin or Platform Operator.
+     */
+    public static boolean isAdmin() {
+        return hasRole(com.spectrayan.spector.commons.security.SpectorRoles.ADMIN) || isSuperAdmin();
     }
 
     /**
